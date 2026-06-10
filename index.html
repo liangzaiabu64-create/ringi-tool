@@ -309,8 +309,8 @@ def generate(data: dict, out_path: str):
       items: [{name, qty, unit, price, vendor}]
       tax_rate: float
       pay_term: str
-      pay_plan: [{label, ym}]
-      delivery: [str]
+      pay_plan: [{label, ym}]   # ym は "YYYY-MM" 推奨(日付+年月書式で出力)。自由文字列も可(そのまま文字で出力)
+      delivery: [str]           # "YYYY-MM" 推奨。1品目=日付(年月表示)、複数品目=「①2026年9月」形式の文字列
       attach: str (任意)
       app_date: str (任意) "YYYY-MM-DD"。省略時は当日 → U3
       contact: str (任意) 連絡責任者名 → R10 (キー自体が無ければテンプレ既定のまま)
@@ -380,20 +380,46 @@ def generate(data: dict, out_path: str):
     _set(ws, r_tax, 18, f"=R{r_total}*{tax_rate}")
 
     # --- 支払条件 ---
+    # ym/納期が "YYYY-MM" 形式なら実例と同じく日付データ+「yyyy"年"m"月"」書式で書く
+    YM_FMT = 'yyyy"年"m"月"'
+
+    def _ym_dt(s):
+        s = str(s or "")
+        if len(s) == 7 and s[4] == "-" and s[:4].isdigit() and s[5:7].isdigit():
+            try:
+                return datetime(int(s[:4]), int(s[5:7]), 1)
+            except ValueError:
+                return None
+        return None
+
+    def _set_ym(row, col, value):
+        """YYYY-MMなら日付+年月書式、それ以外は文字列のまま(後方互換)。"""
+        dt = _ym_dt(value)
+        if dt:
+            _set(ws, row, col, dt)
+            ws.cell(row=row, column=col).number_format = YM_FMT
+        else:
+            _set(ws, row, col, value)
+
     _set(ws, r_pay_term, 6, data.get("pay_term", ""))  # F
     multi_pay = len(pay_plan) > 1
     for i, p in enumerate(pay_plan):
         r = r_pay_first + i
         pre = CIRCLED[i] if multi_pay else ""
         _set(ws, r, 6, f"{pre}{p.get('label','支払予定')}")  # F
-        _set(ws, r, 11, p.get("ym", ""))                      # K
+        _set_ym(r, 11, p.get("ym", ""))                       # K 日付(年月表示)
 
     # --- 納期 ---
     multi_dlv = len(delivery) > 1
     for i, d in enumerate(delivery):
         r = r_deliv_label + i
-        pre = CIRCLED[i] if multi_dlv else ""
-        _set(ws, r, 6, f"{pre}{d}")  # F44...
+        dt = _ym_dt(d)
+        if multi_dlv:
+            # 複数品目は実例どおり「①2026年9月」形式の文字列
+            text = f"{CIRCLED[i]}{dt.year}年{dt.month}月" if dt else f"{CIRCLED[i]}{d}"
+            _set(ws, r, 6, text)  # F44...
+        else:
+            _set_ym(r, 6, d)      # 1品目は実例どおり日付(年月表示)
 
     # --- 添付資料・別紙枚数 ---
     attach = data.get("attach") or f"御見積書{n_items if multi else 1}通"
@@ -752,26 +778,29 @@ const CIRCLED=["①","②","③","④","⑤","⑥","⑦","⑧","⑨","⑩"];
 const THRESHOLD=1000000;
 const MODEL="claude-sonnet-4-6";
 const KEY_STORE="ringi_anthropic_key";
+const PAY_TERM_LOW="納入検収後20日締め翌月15日現金振り込み";       // 支払額100万円未満
+const PAY_TERM_HIGH="納入検収後20日締め翌月起算90日後現金振り込み"; // 支払額100万円以上
 
 const EXTRACT_PROMPT=`あなたは製造業（食品工場）の設備管理部門で、決裁者を説得する稟議書を起草する専門スタッフです。添付された見積書または注文書（画像またはPDF）を読み取り、稟議書に必要な情報を抽出・作成してください。
 
 出力は下記JSONのみ。前置き・後置き・コードブロック記号は一切付けないこと。
 
 {
-  "kenmei": "件名。購入/修理の対象を簡潔かつ具体的に",
-  "reason": "起案理由。(1)背景・現状 (2)必要性とリスク (3)結論 の3段構成で3〜5文。冒頭は全角スペース1つ。丁寧な敬体で事実と論理で説得。設備名・部品名を具体的に織り込む。",
-  "items": [{"name":"品名","qty":数量の数値,"unit":"単位","price":単価の数値,"vendor":"発注先(発行会社名)"}],
+  "kenmei": "件名。簡潔に要点のみ、15〜25文字程度（例：「NID充填ポンプ整備部品購入」「新ラインロータリーポンプ交換」）。仕様・型式・修飾語は入れない",
+  "reason": "起案理由。200〜250字以内で簡潔に要点を押さえる。(1)現状 (2)必要性・放置した場合のリスク (3)結論 の順で2〜4文。冒頭は全角スペース1つ。丁寧な敬体。",
+  "items": [{"name":"品名。『メーカー名＋品名（型式）』のみで簡潔に。仕様や説明文は入れない","qty":数量の数値,"unit":"単位","price":単価の数値,"vendor":"発注先。見積書発行元の会社名を一字一句正確に読み取る（例：株式会社UK）。『松本支社』などの支社・支店・営業所名は付けず、正式社名のみ"}],
   "tax_rate": 0.10,
-  "pay_term": "支払条件(見積書の支払条件欄)",
-  "pay_plan": [{"label":"支払予定","ym":"YYYY年M月"}],
-  "delivery": ["納期(品目ごと)"],
+  "delivery_ym": ["品目ごとの納期を YYYY-MM 形式で（見積書に納期の記載がある場合のみ。読み取れなければ空文字）。itemsと同じ順・同じ個数"],
   "est_no": "見積番号(あれば)"
 }
-金額・数量・税率は数値型。itemsは明細ごと。全フィールドを必ず埋める。`;
+金額・数量・税率は数値型。itemsは明細ごと。社名・品名の漢字や英字は推測せず、書かれている通り正確に。`;
 
 function readKey(){try{return localStorage.getItem(KEY_STORE)||""}catch(e){return ""}}
 function fileToB64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result.split(",")[1]);r.onerror=rej;r.readAsDataURL(file)})}
 function todayISO(){const t=new Date();return t.getFullYear()+"-"+String(t.getMonth()+1).padStart(2,"0")+"-"+String(t.getDate()).padStart(2,"0")}
+// "YYYY-MM" の月計算と表示変換("2026年7月")
+function ymAdd(ym,k){if(!/^\d{4}-\d{2}$/.test(ym||""))return "";let[y,m]=ym.split("-").map(Number);m+=k;while(m<1){m+=12;y--}while(m>12){m-=12;y++}return y+"-"+String(m).padStart(2,"0")}
+function ymDisp(ym){if(!/^\d{4}-\d{2}$/.test(ym||""))return "";const[y,m]=ym.split("-").map(Number);return y+"年"+m+"月"}
 // PDFの各ページをPNG(base64)に変換(最大10ページ)。Excelの見積書シート貼り付け用
 async function pdfToPngs(file){
   if(!window.pdfjsLib) throw new Error("PDF読み取り部品の読み込みに失敗しました。ページを再読み込みしてください。");
@@ -802,9 +831,9 @@ function App(){
   const [appDate,setAppDate]=useState(todayISO());
   const [contact,setContact]=useState("阿部　良哉");
   const [items,setItems]=useState([blankItem()]);
-  const [payTerm,setPayTerm]=useState("検収後20日締め、翌月15日現金振込み");
-  const [payPlan,setPayPlan]=useState([{label:"支払予定",ym:""}]);
-  const [delivery,setDelivery]=useState([""]);
+  const [payTerm,setPayTerm]=useState(PAY_TERM_LOW);
+  const [payTermTouched,setPayTermTouched]=useState(false);
+  const [payYms,setPayYms]=useState([""]);  // 品目ごとの支払予定月 "YYYY-MM"
   const [ringiNo,setRingiNo]=useState("");
   const [estNo,setEstNo]=useState("");
   const [place,setPlace]=useState("カンロ㈱朝日工場");
@@ -825,6 +854,12 @@ function App(){
   const subtotal=useMemo(()=>items.reduce((s,it)=>s+(Number(it.qty)||0)*(Number(it.price)||0),0),[items]);
   const tax=Math.round(subtotal*0.10); const grand=subtotal+tax;
   const needOrder=grand>=THRESHOLD;
+  // 支払条件: 支払額(税込総額)が100万円以上/未満で自動選択(手動で変更した後は維持)
+  useEffect(()=>{if(!payTermTouched)setPayTerm(grand>=THRESHOLD?PAY_TERM_HIGH:PAY_TERM_LOW)},[grand,payTermTouched]);
+  // 支払予定の行数を品目数に同期(①②…が品目と対応)
+  useEffect(()=>{setPayYms(p=>{const n=p.slice(0,items.length);while(n.length<items.length)n.push("");return n})},[items.length]);
+  // 納期 = 各支払予定月の1か月前(自動算出)
+  const deliveryYms=payYms.map(ym=>ymAdd(ym,-1));
   const vendor0=items.find(it=>it.vendor.trim())?.vendor||"";
   const today=new Date();
   const dp=(appDate||todayISO()).split("-").map(Number);
@@ -865,9 +900,12 @@ function App(){
       if(o.kenmei) setKenmei(o.kenmei);
       if(o.reason) setReason(o.reason);
       if(Array.isArray(o.items)&&o.items.length) setItems(o.items.map(it=>({name:it.name||"",qty:String(it.qty??"1"),unit:it.unit||"式",price:it.price??"",vendor:it.vendor||""})));
-      if(o.pay_term) setPayTerm(o.pay_term);
-      if(Array.isArray(o.pay_plan)&&o.pay_plan.length) setPayPlan(o.pay_plan.map(p=>({label:p.label||"支払予定",ym:p.ym||""})));
-      if(Array.isArray(o.delivery)&&o.delivery.length) setDelivery(o.delivery.map(String));
+      if(Array.isArray(o.delivery_ym)&&o.delivery_ym.length){
+        // 見積書の納期(YYYY-MM)から支払予定月=納期+1か月を自動セット
+        const n=(Array.isArray(o.items)&&o.items.length)?o.items.length:o.delivery_ym.length;
+        const pays=[];for(let i=0;i<n;i++){const d=o.delivery_ym[i]||"";pays.push(/^\d{4}-\d{2}$/.test(d)?ymAdd(d,1):"");}
+        setPayYms(pays);
+      }
       if(o.est_no) setEstNo(o.est_no);
       markAI(o);
       showToast("見積書から自動入力しました。内容をご確認ください");
@@ -893,7 +931,7 @@ function App(){
     setRewriting(false);
   };
 
-  const buildData=()=>({kenmei,reason,app_date:appDate,contact,items:items.map(it=>({name:it.name,qty:Number(it.qty)||0,unit:it.unit,price:Number(it.price)||0,vendor:it.vendor})),tax_rate:0.10,pay_term:payTerm,pay_plan:payPlan.map(p=>({label:p.label,ym:p.ym})),delivery});
+  const buildData=()=>({kenmei,reason,app_date:appDate,contact,items:items.map(it=>({name:it.name,qty:Number(it.qty)||0,unit:it.unit,price:Number(it.price)||0,vendor:it.vendor})),tax_rate:0.10,pay_term:payTerm,pay_plan:payYms.slice(0,items.length).map(ym=>({label:"支払予定",ym})),delivery:deliveryYms.slice(0,items.length)});
   // アップロード(PDF/画像)をすべてPNG(base64)に変換 → 見積書シート貼り付け用
   const collectQuoteImages=async()=>{
     const arr=[];
@@ -923,7 +961,7 @@ import json,io,base64
 _d=json.loads(RINGI_JSON);_b=io.BytesIO();generate(_d,_b)
 base64.b64encode(_b.getvalue()).decode()`);
       if(needOrder){
-        const orderPayload={ringi_no:ringiNo,vendor:vendor0,est_no:estNo,delivery:(delivery[0]||""),place,pay_term:payTerm,items:buildData().items,tax_rate:0.10,app_date:appDate};
+        const orderPayload={ringi_no:ringiNo,vendor:vendor0,est_no:estNo,delivery:ymDisp(deliveryYms[0])||"",place,pay_term:payTerm,items:buildData().items,tax_rate:0.10,app_date:appDate};
         const orderBytes=await runPy("ORDER_JSON",orderPayload,`
 import json,io,base64
 _o=json.loads(ORDER_JSON);_b=io.BytesIO();generate_order(_o,_b)
@@ -1074,24 +1112,23 @@ base64.b64encode(_b.getvalue()).decode()`);
               </div>
             </div>}
 
-            <div className="fg" style={{marginTop:18}}><label>3　支払条件{aiFields.pay_term&&<span className="src">AI</span>}</label>
-              <input className="fld" value={payTerm} onChange={e=>setPayTerm(e.target.value)} />
+            <div className="fg" style={{marginTop:18}}><label>3　支払条件（支払額で自動選択・変更可）</label>
+              <select className="fld" value={payTerm} onChange={e=>{setPayTerm(e.target.value);setPayTermTouched(true);}}>
+                <option value={PAY_TERM_LOW}>100万円未満：{PAY_TERM_LOW}</option>
+                <option value={PAY_TERM_HIGH}>100万円以上：{PAY_TERM_HIGH}</option>
+              </select>
               <div className="rowset" style={{marginTop:9}}>
-                {payPlan.map((p,i)=><div className="row2" key={i}>
-                  <input className="fld" value={p.label} onChange={e=>setPayPlan(x=>x.map((y,j)=>j===i?{...y,label:e.target.value}:y))} />
-                  <input className="fld" value={p.ym} placeholder="支払月（例：2026年5月）" onChange={e=>setPayPlan(x=>x.map((y,j)=>j===i?{...y,ym:e.target.value}:y))} />
-                  {payPlan.length>1&&<button className="delmini" onClick={()=>setPayPlan(x=>x.filter((_,j)=>j!==i))}>×</button>}
+                {items.map((it,i)=><div className="row2" key={i}>
+                  <input className="fld" value={(items.length>1?CIRCLED[i]:"")+"支払予定"} disabled style={{background:"#f6f3ec",color:"#6b5d49"}} />
+                  <input className="fld" type="month" value={payYms[i]||""} onChange={e=>setPayYms(x=>x.map((y,j)=>j===i?e.target.value:y))} />
                 </div>)}
-                <button className="addmini" onClick={()=>setPayPlan(x=>[...x,{label:"支払予定",ym:""}])}>＋ 支払予定を追加</button>
               </div>
             </div>
-            <div className="fg"><label>4　納期{aiFields.delivery&&<span className="src">AI</span>}</label>
+            <div className="fg"><label>4　納期（自動：支払予定の1か月前）</label>
               <div className="rowset">
-                {delivery.map((d,i)=><div className="row1" key={i}>
-                  <input className="fld" value={d} placeholder="例：2026年7月 / 1週間程度" onChange={e=>setDelivery(x=>x.map((y,j)=>j===i?e.target.value:y))} />
-                  {delivery.length>1&&<button className="delmini" onClick={()=>setDelivery(x=>x.filter((_,j)=>j!==i))}>×</button>}
+                {items.map((it,i)=><div className="row1" key={i}>
+                  <input className="fld" value={(items.length>1?CIRCLED[i]:"")+(ymDisp(deliveryYms[i])||"")} placeholder="支払予定の月を選ぶと自動で入ります" disabled style={{background:"#f6f3ec",color:"#6b5d49"}} />
                 </div>)}
-                <button className="addmini" onClick={()=>setDelivery(x=>[...x,""])}>＋ 納期を追加</button>
               </div>
             </div>
           </div>
@@ -1130,8 +1167,8 @@ base64.b64encode(_b.getvalue()).decode()`);
                 </tbody></table>
               <div className="taxrow">(別途消費税 {tax.toLocaleString("ja-JP")} )</div></div>
             <div className="sec"><div className="sec-t">３　支払条件</div>
-              <div className="sec-b">{payTerm}<div className="plist">{payPlan.map((p,i)=><div key={i}>{payPlan.length>1?CIRCLED[i]:""}{p.label}：{p.ym||"（支払月）"}</div>)}</div></div></div>
-            <div className="sec"><div className="sec-t">４　納期</div><div className="plist sec-b">{delivery.map((d,i)=><div key={i}>{delivery.length>1?CIRCLED[i]:""}{d||"（納期）"}</div>)}</div></div>
+              <div className="sec-b">{payTerm}<div className="plist">{items.map((it,i)=><div key={i}>{items.length>1?CIRCLED[i]:""}支払予定：{ymDisp(payYms[i])||"（支払月）"}</div>)}</div></div></div>
+            <div className="sec"><div className="sec-t">４　納期</div><div className="plist sec-b">{items.map((it,i)=><div key={i}>{items.length>1?CIRCLED[i]:""}{ymDisp(deliveryYms[i])||"（納期）"}</div>)}</div></div>
             <div className="sec"><div className="sec-t">５　計画区分</div><div className="sec-b manual">※Excelで開いた後に手入力</div></div>
             <div className="sec"><div className="sec-t">６　設置個所</div><div className="sec-b manual">※Excelで開いた後に手入力</div></div>
             <div className="sec"><div className="sec-t">７　添付資料</div><div className="sec-b">御見積書{items.length>1?items.length:1}通{needOrder?"　／　注文書1通":""}{ups.length>0&&<div style={{fontSize:10,color:"#8a7aa0",marginTop:3}}>※添付{ups.length}件を2ページ目「見積書」シートに貼り付け</div>}</div></div>
@@ -1146,7 +1183,7 @@ base64.b64encode(_b.getvalue()).decode()`);
             <div style={{fontSize:10.5,marginBottom:10}}>　下記の内容にて注文致します。</div>
             <div className="obox"><div className="k">注文金額</div><div className="v" style={{fontWeight:700}}>{yen(grand)}</div></div>
             <div className="obox"><div className="k">見積番号</div><div className="v">{estNo||"—"}</div></div>
-            <div className="obox"><div className="k">納　期</div><div className="v">{delivery[0]||"—"}</div></div>
+            <div className="obox"><div className="k">納　期</div><div className="v">{ymDisp(deliveryYms[0])||"—"}</div></div>
             <div className="obox"><div className="k">納品場所</div><div className="v">{place}</div></div>
             <div className="obox"><div className="k">支払条件</div><div className="v">{payTerm}</div></div>
             <table><thead><tr><th>品　名</th><th style={{width:"12%"}}>数量</th><th style={{width:"10%"}}>単位</th><th style={{width:"20%"}}>単　価</th><th style={{width:"22%"}}>金　額</th></tr></thead>
