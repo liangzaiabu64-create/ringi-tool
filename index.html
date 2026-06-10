@@ -355,14 +355,34 @@ def generate(data: dict, out_path: str):
     # ====== ここから値を流し込む。行番号は調整後にずれているので再計算 ======
     item_shift = n_items - N_TEMPLATE_ITEMS
     pay_shift = len(pay_plan) - N_TEMPLATE_PAY
+    dlv_shift = len(delivery) - N_TEMPLATE_DELIV
     # 各アンカーの調整後行
     r_total = ROW_TOTAL + item_shift
     r_tax = ROW_TAX + item_shift
     r_pay_term = ROW_PAY_TERM + item_shift
     r_pay_first = ROW_PAY_FIRST + item_shift
     r_deliv_label = ROW_DELIV_LABEL + item_shift + pay_shift
-    r_attach = ROW_ATTACH + item_shift + pay_shift + (len(delivery) - N_TEMPLATE_DELIV)
-    r_besshi = ROW_BESSHI + item_shift + pay_shift + (len(delivery) - N_TEMPLATE_DELIV)
+    r_attach = ROW_ATTACH + item_shift + pay_shift + dlv_shift
+    r_besshi = ROW_BESSHI + item_shift + pay_shift + dlv_shift
+
+    # --- 行シフトが起きた場合は無加工テンプレから書式を丸ごと復元 ---
+    # openpyxlの行削除/挿入は結合セル内部の罫線を失い、行高さもずらさないため、
+    # 「テンプレ行 → 調整後の対応行」へスタイルと行高さを再適用する(欠け・二重の両方を防ぐ)。
+    if item_shift or pay_shift or dlv_shift:
+        pairs = [(30, 30)]
+        for i in range(n_items):
+            pairs.append((min(ROW_ITEM_FIRST + i, ROW_ITEM_FIRST + 2), ROW_ITEM_FIRST + i))
+        pairs += [(ROW_TOTAL, r_total), (ROW_TAX, r_tax)]
+        for t in (36, 37, ROW_PAY_TERM, 39):
+            pairs.append((t, t + item_shift))
+        for i in range(len(pay_plan)):
+            pairs.append((min(ROW_PAY_FIRST + i, ROW_PAY_FIRST + 2), r_pay_first + i))
+        pairs.append((43, 43 + item_shift + pay_shift))
+        for i in range(len(delivery)):
+            pairs.append((min(ROW_DELIV_LABEL + i, ROW_DELIV_LABEL + 2), r_deliv_label + i))
+        for t in range(47, 59):
+            pairs.append((t, t + item_shift + pay_shift + dlv_shift))
+        _restyle_after_shift(ws, pairs)
 
     # --- ヘッダ: 申請日(西暦)・連絡責任者・件名・起案理由 ---
     _set(ws, ROW_DATE, 21, _parse_date(data.get("app_date")))  # U3
@@ -539,6 +559,42 @@ def _paste_quotes(wb, images_b64):
 
     # シートの使用範囲を最終行まで広げる(範囲外の改ページは無視されるため)
     es.cell(row=total_rows, column=1).value = " "
+
+def _restyle_after_shift(ws, pairs):
+    """
+    無加工テンプレートの行スタイル(罫線・フォント・塗り・配置・表示形式)と
+    行高さを、行シフト後の対応行へ丸ごと再適用する。
+    背景: openpyxlのdelete_rows/insert_rowsは、結合範囲の内側セルが持つ罫線を
+    失わせ(unmerge時にスタイルが消える)、row_dimensionsもシフトしないため、
+    品目数などが3以外のとき表の線が欠けたり行高さがずれる。
+    pairs: [(テンプレ行, 出力先行), ...]
+    """
+    from copy import copy as _copy
+    import io as _io
+    tpl = openpyxl.load_workbook(_io.BytesIO(TEMPLATE_BYTES))["稟議書"]
+    for (sr, dr) in pairs:
+        for c in range(2, 29):  # B..AB
+            s = tpl.cell(row=sr, column=c)
+            d = ws.cell(row=dr, column=c)
+            try:
+                d.font = _copy(s.font)
+                d.border = _copy(s.border)
+                d.fill = _copy(s.fill)
+                d.alignment = _copy(s.alignment)
+                d.number_format = s.number_format
+            except AttributeError:
+                pass
+        rd = ws.row_dimensions[dr]
+        if sr in tpl.row_dimensions:
+            sd = tpl.row_dimensions[sr]
+            rd.height = sd.height
+            rd.thickTop = sd.thickTop
+            rd.thickBot = sd.thickBot
+        else:
+            rd.height = None
+            rd.thickTop = False
+            rd.thickBot = False
+
 
 def _adjust_block(ws, first_row, template_count, target_count, style_col_from,
                   merge_spec=None):
